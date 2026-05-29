@@ -189,6 +189,7 @@ class LBBridge(Bridge):
         async def start_worker():
             self.injected_worker = await Worker(
                                 self.scheduler_address,
+                                name=f"bridge_worker_{self.id}",
                                 local_directory="/tmp",
                                 memory_limit="10GiB",
                                 memory_target_fraction=False,
@@ -199,20 +200,16 @@ class LBBridge(Bridge):
 
         print(f"[LBBridge-{rank}] Injection starting\n")
         
-        if self.client is not None:
-            self.client.sync(start_worker)
-        else:
-            self.loop = asyncio.new_event_loop()
+        self.loop = asyncio.new_event_loop()
 
-            def thread_main():
-                asyncio.set_event_loop(self.loop)
-                self.loop.run_forever()
+        #def thread_main():
+        #    asyncio.set_event_loop(self.loop)
+        #    self.loop.run_forever()
 
-            self.worker_thread = threading.Thread(target=thread_main, daemon=True)
-            self.worker_thread.start()
+        self.worker_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.worker_thread.start()
 
-            future = asyncio.run_coroutine_threadsafe(start_worker(), self.loop)
-            future.result()
+        asyncio.run_coroutine_threadsafe(start_worker(), self.loop)
 
         if rank == 0:
 
@@ -249,17 +246,17 @@ class LBBridge(Bridge):
 
             self.injected_worker = None
         
-        if self.client is not None:
-            self.client.sync(await_worker_retirement, self.injected_worker)
-        else:
-            future = asyncio.run_coroutine_threadsafe(await_worker_retirement(), self.loop)
-            future.result()
+        future = asyncio.run_coroutine_threadsafe(await_worker_retirement(), self.loop)
+        future.result()
 
-            #if self.worker_thread is not None:
-                #self.worker_thread.join()
-            self.loop.close()
-            self.loop = None
-            self.worker_thread = None
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        #while self.loop.is_running():
+        #    print("Loop is runnning")
+        #    time.sleep(0.1)
+        self.worker_thread.join()
+        self.loop.call_soon_threadsafe(self.loop.close)
+        self.loop = None
+        self.worker_thread = None
 
         self.comm.Barrier()
 
