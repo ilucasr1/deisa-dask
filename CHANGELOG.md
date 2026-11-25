@@ -16,12 +16,156 @@ Types of changes:
 
 ## [Unreleased]
 
+### Added
+
+- `deisa.dask.bridge.send`: zero-copy scatter path when the receiving worker is process-local.
+
+### Fixed
+
+- Bridge: internal clients no longer become the process-wide Dask default (`set_as_default=False`); `_get_actor`
+  scopes its client with `as_current()` because `Lock` resolves from the current client.
+- Bridge: an idle client that lost its scheduler now closes itself instead of holding the global scheduler
+  config through the reconnect window.
+- Deisa: the client no longer becomes the process-wide default (`set_as_default=False`); registered callbacks
+  run inside `client.as_current()` so a bare `.compute()` resolves to the client owning the delivered futures.
+- test: `reset_dask_scheduler` fixture now actually restores `dask.config["scheduler"]` after each test.
+
+### Changed
+
+- getting-started: add feedback (`bridge.get()` and `deisa.set()`)
+- `deisa.dask.bridge.send`: refactor into a _select_workers / _ship_chunk / _publish_metadata pipeline, 
+  unifying the single-bridge and gathered publish paths into one implementation (no more _direct_send duplicate)
+- `deisa.dask.bridge.send`: zero-copy scatter path cleanup. One scatter primitive (`_scatter_payload`) is the only
+  caller of `_better_scatter_to_workers`; `_scatter_full` ships one key and returns the same normalized
+  `scatter_result` shape (`future`, `who_has`, `nbytes`) as `_scatter_partials`; the futures topic-event entries
+  are born once in `_scatter_partials` and travel unchanged to `_publish_metadata` (the `shape_dtype` sidecar is
+  gone). Deleted: `_scatter_blocking`, `_scatter_to_workers_async`, `_build_futures_payload`, and the legacy
+  iterator/set/tuple `hash=` input normalization. The `_await_scatter` helper replaces the four duplicated
+  client/no-client dispatch sites.
+
+
+## [0.7.0]
+
+### Added
+
+- CI: continuous benchmark using Bencher.
+- Bridge-local precompute: callbacks whose compute operations are chunk-local reductions (`sum`, `mean`, `var`, `std`, 
+  `min`, `max`, `prod`) are analyzed at registration time and shipped to Dask workers as small per-bridge partials 
+  instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
+  array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
+- `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block (`n_samples`, `mean`,
+  `components`, `singular_values`) merges with another summary into the exact summary of their
+  union, without either source sample ever reaching a merge node, so only a compact summary has to cross a process or
+  network boundary. `merge_tree` reduces summaries with a balanced pairwise tree. The merge algebra is classical and is
+  attributed as such in the module docstring: the between-block mean-correction term is the Chan-Golub-LeVeque (1979)
+  covariance merge and the merge-and-truncate tree shape is Qin & Yan (arXiv:1601.07010) / Kjolstad, Demmel et al.
+  (arXiv:1710.02812).
+- `deisa.dask.mergeable_pca.MergeablePCA`: a scikit-learn-style PCA estimator for Dask arrays, built on those
+  primitives. `fit` reduces one `local_pca` summary per input block with a balanced tree of `merge_pca` tasks, so no
+  source sample reaches a merge node and the result is the exact batch PCA at full local rank. `local_rank=R`
+  truncates each leaf summary to rank `R` before merging, shrinking what crosses a process boundary at the cost of a
+  retained subspace that drifts from the batch one. `fit` refuses rather than approximates: input that is not 2D, a
+  feature dimension split across chunks, a zero-size axis, or an `n_components` above the achievable rank each raise a
+  `ValueError` naming the condition and the remedy. `_fit_dask_delayed` builds the tree WITHOUT computing and returns a
+  real Dask graph, so it can be inspected or `.visualize()`d; `_fit_dask` is the `.compute()` on top. The merged root
+  summary is kept as `_summary_` for further merging (and for the bridge to emit), separate from the truncated public
+  `components_` / `singular_values_` / `explained_variance_`, so nothing destroys mergeability mid-tree.
+- `Bridge.send()` now additionally handles 0D ndarray and 1D `ndarray` of size 1 as the timestep argument type.
+
+### Changed
+
+- `mpi4py` is now a required dependency.
+
+### Fixed
+
+- Bridge: `asyncio.run()` is no longer called with a running event loop. On the no-client path
+  (`_scatter_full`, `_scatter_partials`), a loop left running on the calling thread during teardown made
+  `asyncio.run` raise `RuntimeError: asyncio.run() cannot be called from a running event loop`, surfacing as
+  spurious "Error while closing bridges" errors during teardown. The scatter path now runs the coroutine through
+  `Bridge._run_async`: `asyncio.run` when the thread has no running loop, otherwise
+  `deisa.dask.utils.run_coro_on_private_loop`, which hosts a fresh loop on a short-lived worker thread (blocking
+  the caller's running loop would deadlock, since a running loop cannot be re-entered).
+- Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
+- Deisa: avoid exceptions raised from `__del__()`
+
+## [0.6.3]
+
+### Added
+
+- CI: run mpi tests against openmpi and mpich.
+- benchmark: time-to-callback. Measure the time between `Bridge.send()` and the execution of a callback.
+- Define Ruff code format.
+- CI: check code format and style using Ruff linter.
+- check monotonically increasing timestep in callbacks.
+
+### Fixed
+
+- Deisa `execute_callbacks` block until all callbacks complete.
+- Deisa `_free_windows` concurrency issue.
+- inconsistent iteration in callback data.
+
+## [0.6.2]
+
+### Fixed
+
+- Bridge `_gather_global_metadata` now return a sorted list of _global_array_names.
+  This fixes `_setup_array_comms` not seeing the same list order.
+
+## [0.6.1]
+
+### Changed
+
+- move `pytest.ini` to the repo root.
+- add non-distributed array in mpi test.
+
+### Fixed
+
+- Non-distributed arrays are now handled correctly.
+- Bridge.send `update_workers` now uses the sub-communicator.
+- CI: install `mpi4py` and `openmpi` together using pip.
+
+## [0.6.0]
+
+### Added
+
+- documentation website
+- getting started example code
+- feature: per-array communicator.
+  This feature also enables the handling of non-distributed arrays.
+- optimize: zero-copy Bridge.send() when local worker.
+
+## [0.5.1]
+
+### Added
+
+- codemeta.json
+
+### Changed
+
+- replace the setup.py by a pyproject.toml
+- use chunk position from arrays_metadata instead of the chunk position from the bridge communicator
+
+### Fixed
+
+- UserWarning: Client desires key but key is unknown
+
+## [0.5.0]
+
+### Added
+
+- constants.py: to regroup constants
+- Deisa.__del__: to cleanup stored Futures
+
 ### Changed
 
 - set minimal dask version to 2024.9.0
 - rename Bridge.send's iteration argument to timetep
-- bridge.send: per bridge id and iteration round-robin over the workers
+- bridge.send: per bridge id and iteration round-robin over the workers so that data is not scattered to the same worker
 - use barrier instead of gather in bridge close
+- bridge.execute_callbacks: wait for all tasks to finish before closing
+- prefix Future keys with `KEY_PREFIX` to help identify associated tasks
+- use a `weakref` inside the topic handler to avoid circular references
+- move constants from `deisa.py` to `constants.py`
 
 ## [0.4.1]
 

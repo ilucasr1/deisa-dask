@@ -27,36 +27,40 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
-from typing import Optional
+from typing import List, Optional
 
-from distributed import Future, get_client, Event, Client
+from distributed import Client, Event, Future, get_client
 
+from deisa.dask.branch import BranchSpec
+from deisa.dask.constants import KEY_PREFIX
 from deisa.dask.utils import _get_actor
 
 logger = logging.getLogger(__name__)
 
 
 class Handshake:
-    _DEISA_HANDSHAKE_ACTOR_FUTURE_VARIABLE = 'deisa_handshake_actor_future'
-    _DEISA_WAIT_FOR_DONE_EVENT = 'deisa_handshake_done'
-    _DEISA_WAIT_FOR_BRIDGE_DONE_EVENT = 'deisa_handshake_bridge_done'
-    _DEISA_WAIT_FOR_GO_EVENT = 'deisa_handshake_go'
+    _DEISA_HANDSHAKE_ACTOR_FUTURE_VARIABLE = "deisa_handshake_actor_future"
+    _DEISA_WAIT_FOR_DONE_EVENT = "deisa_handshake_done"
+    _DEISA_WAIT_FOR_BRIDGE_DONE_EVENT = "deisa_handshake_bridge_done"
+    _DEISA_WAIT_FOR_GO_EVENT = "deisa_handshake_go"
 
     class HandshakeActor:
         def __init__(self):
-            logger.debug('HandshakeActor.__init__()')
+            logger.debug("HandshakeActor.__init__()")
             self.analytics_ready = False
             self.client = get_client()
             self.nb_bridges = 0
             self.arrays_metadata = {}
             self.bridges_ready = False
-            self.analytics_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
+            self.task_branches = {}  # array_name -> List[Dict] for bridge-local execution
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
-            logger.debug(f"set_bridges_ready(): nb_bridges={nb_bridges}, arrays_metadata={arrays_metadata}, "
-                         f"analytics_ready={self.analytics_ready}")
+            logger.debug(
+                f"set_bridges_ready(): nb_bridges={nb_bridges}, arrays_metadata={arrays_metadata}, "
+                f"analytics_ready={self.analytics_ready}"
+            )
             self.nb_bridges = nb_bridges
             self.arrays_metadata = arrays_metadata
             self.bridges_ready = True
@@ -83,6 +87,13 @@ class Handshake:
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
 
+        def set_task_branches(self, array_name: str, hints: list) -> None:
+            logger.debug(f"set_task_branches(): array_name={array_name}, hints={hints}")
+            self.task_branches[array_name] = hints
+
+        def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
+            return self.task_branches.get(array_name, [])
+
         def __go(self) -> None:
             logger.debug("Handshake go !")
             Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).set()
@@ -91,7 +102,9 @@ class Handshake:
         self.client = client
         self.__handshake_actor: Optional[Handshake.HandshakeActor] = None
         if self.client:
-            self.__handshake_actor = _get_actor(self.client, Handshake.HandshakeActor)
+            self.__handshake_actor = _get_actor(
+                self.client, Handshake.HandshakeActor, key=f"{KEY_PREFIX}-HandshakeActor"
+            )
             assert self.__handshake_actor is not None
 
     def all_bridges_ready(self, nb_bridge: int, arrays_metadata: dict, wait_for_go=True) -> None:
@@ -129,6 +142,14 @@ class Handshake:
     def get_nb_bridges(self) -> int:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
+
+    def set_task_branches(self, array_name: str, hints: list) -> None:
+        assert self.__handshake_actor is not None
+        self.__handshake_actor.set_task_branches(array_name, hints).result()
+
+    def get_task_branches(self, array_name: str) -> List[BranchSpec]:
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.get_task_branches(array_name).result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()

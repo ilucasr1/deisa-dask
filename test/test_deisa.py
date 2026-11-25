@@ -27,11 +27,14 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import abc
+import asyncio
+import gc
+import json
 import logging
 import os.path
 import time
 from collections import deque
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import dask
 import dask.array as da
@@ -39,14 +42,66 @@ import numpy as np
 import pytest
 from deisa.core.types import DeisaArray, Window
 from distributed import Client, LocalCluster, Queue, Variable
-
 from TestSimulator import TestSimulation
-from deisa.dask import Deisa, Bridge
+from utils import (
+    FakeCartComm,
+    FakeComm,
+    _make_callback,
+    async_close_bridges,
+    async_map,
+    dask_array_element_wise_equal,
+    run_on_all_ranks,
+    wait_for,
+)
+
+from deisa.dask import Bridge, Deisa
 from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE
+from deisa.dask.precompute_analyzer import RawFieldReadError, UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
-from utils import wait_for, dask_array_element_wise_equal, FakeComm, async_map, async_close_bridges
 
 logging.basicConfig(level=logging.DEBUG)
+
+META_A = {"a": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
+
+
+class _FakeClient:
+    """Minimal client surface used by Deisa._register_callback_impl."""
+
+    def __init__(self):
+        self.subscribed = []
+
+    def subscribe_topic(self, name, handler):  # noqa: D102
+        self.subscribed.append(name)
+
+    def close(self):  # noqa: D102
+        pass
+
+
+class _FakeHandshake:
+    """Minimal handshake surface used by Deisa._register_callback_impl."""
+
+    def __init__(self):
+        self.branches: Dict[str, Any] = {}
+
+    def set_task_branches(self, array_name, hints):  # noqa: D102
+        self.branches[array_name] = hints
+
+
+def _make_deisa_stub() -> Deisa:
+    """A Deisa instance with the registration surfaces stubbed (no cluster)."""
+    d = Deisa.__new__(Deisa)
+    d.client = _FakeClient()
+    d.handshake = _FakeHandshake()
+    d.arrays_metadata = META_A
+    d._callbacks = {}
+    d._callbacks_by_array = {}
+    d._topic_handlers = {}
+    d._callback_reductions = {}
+    d._callback_seq = 0
+    d._branch_groups = {}
+    d._tasks = set()
+    d._execute_callbacks_called = False
+    return d
 
 
 @pytest.mark.timeout(10)
@@ -54,9 +109,15 @@ logging.basicConfig(level=logging.DEBUG)
 class TestDeisaCtor:
     @pytest.fixture(scope="class")
     def env_setup_tcp_cluster(self):
-        cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=True,
-                               dashboard_address=":0", worker_dashboard_address=":0",
-                               host='127.0.0.1', scheduler_port=4242)
+        cluster = LocalCluster(
+            n_workers=1,
+            threads_per_worker=1,
+            processes=True,
+            dashboard_address=":0",
+            worker_dashboard_address=":0",
+            host="127.0.0.1",
+            scheduler_port=0,
+        )
         client = Client(cluster)
         client.wait_for_workers(1, timeout=20)
         yield cluster
@@ -64,57 +125,115 @@ class TestDeisaCtor:
 
     def test_deisa_ctor_str(self, env_setup_tcp_cluster):
         cluster = env_setup_tcp_cluster
-        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = cluster.scheduler_address
+        os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = cluster.scheduler_address
         deisa = Deisa(wait_for_go=False)
         assert deisa.client is not None, "Deisa should not be None"
         assert deisa.client.scheduler.address == cluster.scheduler_address, "Client should be the same as scheduler"
 
-    def test_deisa_ctor_scheduler_file(self, env_setup_tcp_cluster):
+    def test_deisa_ctor_scheduler_file(self, env_setup_tcp_cluster, tmp_path):
         cluster = env_setup_tcp_cluster
-        f = os.path.abspath(os.path.dirname(__file__)) + os.path.sep + 'test-scheduler.json'
-        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = f
+        # ``Client(scheduler_file=...)`` only reads "address", so write it at runtime from the live cluster.
+        scheduler_file = tmp_path / "scheduler.json"
+        scheduler_file.write_text(json.dumps({"address": cluster.scheduler_address}))
+        os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = str(scheduler_file)
         deisa = Deisa(wait_for_go=False)
         assert deisa.client is not None, "Deisa should not be None"
         assert deisa.client.scheduler.address == cluster.scheduler_address, "Client should be the same as scheduler"
 
     @pytest.mark.flaky(retries=3, delay=1)
     def test_deisa_ctor_scheduler_file_error(self):
-        with pytest.raises(ValueError) as e:
-            f = os.path.abspath(os.path.dirname(__file__)) + os.path.sep + 'test-scheduler-error.json'
-            os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = f
+        with pytest.raises(ValueError) as _:
+            f = os.path.abspath(os.path.dirname(__file__)) + os.path.sep + "test-scheduler-error.json"
+            os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = f
             Deisa(wait_for_go=False)
 
 
-@pytest.mark.xdist_group(name="serial")
+# ---------------------------------------------------------------------------
+# Deisa registration surface tests (cluster-free stubs)
+# ---------------------------------------------------------------------------
+class TestDeisaRegistration:
+    def test_registration_success_stores_callback_payload(self):
+        """A successful registration stores the payload in ``_callbacks``.
+
+        The topic handler can only fire a callback whose payload lives in ``_callbacks``; it must be stored once every
+        step that can raise has succeeded.
+        """
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_ok", "s = arr.sum()\nreturn s.compute()")
+        cid = d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        assert cid in d._callbacks
+        assert d._callbacks[cid]["callback"] is cb
+        assert d._callbacks[cid]["array_names"] == ["a"]
+        assert cid in d._callbacks_by_array["a"]
+        # Topic subscription happened for the registered array.
+        assert "a" in d.client.subscribed
+        # Branches are merged in memory at registration; the handshake actor is
+        # filed only by execute_callbacks (the per-cycle filing boundary).
+        assert d._branch_groups["a"]
+        d._flush_branches_to_handshake()
+        assert d.handshake.branches["a"]
+
+    def test_registration_failure_leaves_no_trace(self):
+        """A registration whose analysis raises leaks nothing.
+
+        ``_callbacks[callback_id]`` is written only AFTER the analysis; a raising analysis must leave no half-registered
+        entry that ``unregister_callback`` could never reach.
+        """
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_fail", "s = (arr - arr.mean()).sum()\nreturn s.compute()")
+        with pytest.raises(UnsupportedReductionError):
+            d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        assert d._callbacks == {}
+        assert d._callbacks_by_array == {}
+        assert d.client.subscribed == []
+
+    def test_raw_refusal_does_not_merge_branch_groups(self):
+        """A raw-read refusal must leave no partial branch state behind at registration."""
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_raw_fail", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
+        with pytest.raises(RawFieldReadError):
+            d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        # Same no-trace contract as the UnsupportedReductionError case.
+        assert d._callbacks == {}
+        assert d._callbacks_by_array == {}
+        assert d._branch_groups == {}
+        assert d.client.subscribed == []
+
+    def test_precompute_false_allows_raw_reads_with_warning(self, caplog):
+        """``precompute=False`` skips the analysis entirely: raw reads are allowed with a warning."""
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_raw_ok", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
+        with caplog.at_level(logging.WARNING):
+            cid = d._register_callback_impl(
+                cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=False
+            )
+        assert cid in d._callbacks
+        assert "full-chunk scatter path" in caplog.text
+
+
 class TestUsingDaskCluster:
-    @pytest.fixture(scope="function")
-    def env_setup(self):
+    @pytest.fixture(scope="function", params=[1, 2])
+    def env_setup(self, request):
+        print(f"setup env_setup with {request.param} workers", flush=True)
         self.state: Dict[str, Any] = {"counter": 0}
-        cluster = LocalCluster(n_workers=2, threads_per_worker=1, processes=True,
-                               dashboard_address=":0", worker_dashboard_address=":0")
-        cluster.wait_for_workers(2, timeout=10)
-        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = cluster.scheduler_address
+        cluster = LocalCluster(
+            n_workers=request.param,
+            threads_per_worker=1,
+            processes=True,
+            dashboard_address=":0",
+            worker_dashboard_address=":0",
+        )
+        cluster.wait_for_workers(request.param, timeout=10)
+        os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = cluster.scheduler_address
         client = Client(cluster, name="env_setup")
         yield client, cluster
         # teardown
         client.close()
         cluster.close()
 
-    @pytest.fixture(scope="class")
-    def env_setup_class(self):
-        self.state: Dict[str, Any] = {"counter": 0}
-        cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=False,
-                               dashboard_address=":0", worker_dashboard_address=":0")
-        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = cluster.scheduler_address
-        client = Client(cluster)
-        client.wait_for_workers(1, timeout=10)
-        yield client, cluster
-        # teardown
-        cluster.close()
-
-    @pytest.mark.parametrize('global_shape', [(32, 32), (32, 16), (16, 32)])
-    @pytest.mark.parametrize('local_shape', [(16, 16), (2, 2), (8, 1), (8, 1)])
-    def test_reconstruct_global_dask_array_2d(self, env_setup_class, global_shape, local_shape):
+    @pytest.mark.parametrize("global_shape", [(32, 32), (32, 16), (16, 32)])
+    @pytest.mark.parametrize("local_shape", [(16, 16), (2, 2), (8, 1), (8, 1)])
+    def test_reconstruct_global_dask_array_2d(self, env_setup, global_shape, local_shape):
         print(f"global_shape={global_shape} local_shape={local_shape}")
 
         state = da.random.RandomState(42)
@@ -123,14 +242,13 @@ class TestUsingDaskCluster:
         global_len_x, global_len_y = global_shape
         local_len_x, local_len_y = local_shape
 
-        expected_nb_blocks = (global_len_x // local_len_x
-                              * global_len_y // local_len_y)
+        expected_nb_blocks = global_len_x // local_len_x * global_len_y // local_len_y
 
         # create blocks (i.e. 1 block per mpi rank)
         blocks = []
         for x in range(0, global_len_x, local_len_x):
             for y in range(0, global_len_y, local_len_y):
-                block = global_data[x:x + local_len_x, y:y + local_len_y]
+                block = global_data[x : x + local_len_x, y : y + local_len_y]
                 blocks.append(block)
 
         assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
@@ -138,15 +256,19 @@ class TestUsingDaskCluster:
         # tested method
         reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
 
-        assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
-        assert reconstructed_global_data.chunksize == (local_len_x,
-                                                       local_len_y), "reconstructed global data chunksize does not match original"
-        assert dask_array_element_wise_equal(reconstructed_global_data,
-                                             global_data), "reconstructed global data does not match original"
+        assert reconstructed_global_data.shape == global_data.shape, (
+            "reconstructed global data shape does not match original"
+        )
+        assert reconstructed_global_data.chunksize == (local_len_x, local_len_y), (
+            "reconstructed global data chunksize does not match original"
+        )
+        assert dask_array_element_wise_equal(reconstructed_global_data, global_data), (
+            "reconstructed global data does not match original"
+        )
 
-    @pytest.mark.parametrize('global_shape', [(32, 32, 32), (32, 32, 16), (32, 16, 32), (16, 32, 32), (64, 32, 16)])
-    @pytest.mark.parametrize('local_shape', [(16, 16, 16), (8, 8, 1), (8, 1, 8), (1, 8, 8)])
-    def test_reconstruct_global_dask_array_3d(self, env_setup_class, global_shape, local_shape):
+    @pytest.mark.parametrize("global_shape", [(32, 32, 32), (32, 32, 16), (32, 16, 32), (16, 32, 32), (64, 32, 16)])
+    @pytest.mark.parametrize("local_shape", [(16, 16, 16), (8, 8, 1), (8, 1, 8), (1, 8, 8)])
+    def test_reconstruct_global_dask_array_3d(self, env_setup, global_shape, local_shape):
         print(f"global_shape={global_shape} local_shape={local_shape}")
 
         state = da.random.RandomState(42)
@@ -155,16 +277,14 @@ class TestUsingDaskCluster:
         global_len_x, global_len_y, global_len_z = global_shape
         local_len_x, local_len_y, local_len_z = local_shape
 
-        expected_nb_blocks = (global_len_x // local_len_x
-                              * global_len_y // local_len_y
-                              * global_len_z // local_len_z)
+        expected_nb_blocks = global_len_x // local_len_x * global_len_y // local_len_y * global_len_z // local_len_z
 
         # create blocks (i.e. 1 block per mpi rank)
         blocks = []
         for x in range(0, global_len_x, local_len_x):
             for y in range(0, global_len_y, local_len_y):
                 for z in range(0, global_len_z, local_len_z):
-                    block = global_data[x:x + local_len_x, y:y + local_len_y, z:z + local_len_z]
+                    block = global_data[x : x + local_len_x, y : y + local_len_y, z : z + local_len_z]
                     blocks.append(block)
 
         assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
@@ -172,17 +292,21 @@ class TestUsingDaskCluster:
         # tested method
         reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
 
-        assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
-        assert reconstructed_global_data.chunksize == (local_len_x, local_len_y,
-                                                       local_len_z), "reconstructed global data chunksize does not match original"
-        assert dask_array_element_wise_equal(reconstructed_global_data,
-                                             global_data), "reconstructed global data does not match original"
+        assert reconstructed_global_data.shape == global_data.shape, (
+            "reconstructed global data shape does not match original"
+        )
+        assert reconstructed_global_data.chunksize == (local_len_x, local_len_y, local_len_z), (
+            "reconstructed global data chunksize does not match original"
+        )
+        assert dask_array_element_wise_equal(reconstructed_global_data, global_data), (
+            "reconstructed global data does not match original"
+        )
 
-    def test_reconstruct_global_dask_array_none(self, env_setup_class):
+    def test_reconstruct_global_dask_array_none(self, env_setup):
         with pytest.raises(ValueError):
             Deisa._Deisa__tile_dask_blocks(None, (2, 2))  # access private staticmethod
 
-    def test_reconstruct_global_dask_array_empty(self, env_setup_class):
+    def test_reconstruct_global_dask_array_empty(self, env_setup):
         with pytest.raises(ValueError):
             Deisa._Deisa__tile_dask_blocks([], (2, 2))  # access private staticmethod
 
@@ -199,17 +323,14 @@ class TestUsingDaskCluster:
             datas.append(data)
 
             f = client.scatter(data, direct=True)
-            to_send = {'shape': data.shape,
-                       'dtype': data.dtype,
-                       'f': f,
-                       'f_key': f.key}
+            to_send = {"shape": data.shape, "dtype": data.dtype, "f": f, "f_key": f.key}
             q.put(to_send)
 
         # get 1
         res = q.get()
 
-        assert res['shape'] == datas[0].shape
-        assert res['dtype'] == datas[0].dtype
+        assert res["shape"] == datas[0].shape
+        assert res["dtype"] == datas[0].dtype
 
         darr = da.from_delayed(dask.delayed(res["f"]), res["shape"], dtype=res["dtype"])
         assert darr.compute().all() == datas[0].all()
@@ -224,14 +345,11 @@ class TestUsingDaskCluster:
         data = np.random.random((2, 2))
 
         f = client.scatter(data, direct=True)
-        v.set({'shape': data.shape,
-               'dtype': data.dtype,
-               'f': f,
-               'f_key': f.key})
+        v.set({"shape": data.shape, "dtype": data.dtype, "f": f, "f_key": f.key})
 
         res = v.get()
-        assert res['shape'] == data.shape
-        assert res['dtype'] == data.dtype
+        assert res["shape"] == data.shape
+        assert res["dtype"] == data.dtype
 
         darr = da.from_delayed(dask.delayed(res["f"]), res["shape"], dtype=res["dtype"])
         darr = build_deisa_array(darr, 0)
@@ -252,11 +370,27 @@ class TestUsingDaskCluster:
         def check_array(array_name, state, i, expected):
             assert array_name in state
             assert state[array_name][-1].t == i, "callback was not called with correct timestep"
-            assert dask_array_element_wise_equal(state[array_name][-1], expected[array_name]["global_da"]), \
+            assert dask_array_element_wise_equal(state[array_name][-1], expected[array_name]["global_da"]), (
                 "callback was not called with correct data"
-            assert len(state[array_name]) == min(i, expected[array_name]["window_size"]) \
-                if expected[array_name]["window_size"] is not None else DEFAULT_SLIDING_WINDOW_SIZE, \
-                "callback was not called with correct window size"
+            )
+            assert (
+                len(state[array_name]) == min(i, expected[array_name]["window_size"])
+                if expected[array_name]["window_size"] is not None
+                else DEFAULT_SLIDING_WINDOW_SIZE
+            ), (
+                f"callback was not called with correct window size. "
+                f"{len(state[array_name])=} != {min(i, expected[array_name]['window_size'])=}"
+            )
+
+            # Run some compute using the data. This checks that we can use the data.
+            for darr in state[array_name]:
+                s = darr.sum().compute()
+                print(f"arr={array_name}, t={darr.t}, sum={s}", flush=True)
+
+        @staticmethod
+        def exception_handler(e: BaseException):
+            print(e)
+            pytest.fail()
 
     class SingleArrayName(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
@@ -264,9 +398,14 @@ class TestUsingDaskCluster:
                 state["temperature"] = temperature
                 state["counter"] += 1
 
-            deisa.register_callback(cb,
-                                    Window('temperature', size=expected_window_size['temperature'])
-                                    if expected_window_size['temperature'] else 'temperature')
+            deisa.register_callback(
+                cb,
+                Window("temperature", size=expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                exception_handler=self.exception_handler,
+                precompute=False,
+            )
 
         def check(self, state, i, expected):
             self.check_array("temperature", state, i, expected)
@@ -278,11 +417,17 @@ class TestUsingDaskCluster:
                 state["pressure"] = pressure
                 state["counter"] += 1
 
-            deisa.register_callback(cb,
-                                    Window('temperature', size=expected_window_size['temperature'])
-                                    if expected_window_size['temperature'] else 'temperature',
-                                    Window('pressure', size=expected_window_size['pressure'])
-                                    if expected_window_size['pressure'] else 'pressure')
+            deisa.register_callback(
+                cb,
+                Window("temperature", size=expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                Window("pressure", size=expected_window_size["pressure"])
+                if expected_window_size["pressure"]
+                else "pressure",
+                exception_handler=self.exception_handler,
+                precompute=False,
+            )
 
         def check(self, state, i, expected):
             self.check_array("temperature", state, i, expected)
@@ -290,9 +435,13 @@ class TestUsingDaskCluster:
 
     class SingleArrayNameDecorator(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
-            @deisa.register(Window('temperature', size=expected_window_size['temperature'])
-                            if expected_window_size['temperature']
-                            else 'temperature')
+            @deisa.register(
+                Window("temperature", size=expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                exception_handler=self.exception_handler,
+                precompute=False,
+            )
             def cb(temperature: List[DeisaArray]):
                 state["temperature"] = temperature
                 state["counter"] += 1
@@ -302,12 +451,16 @@ class TestUsingDaskCluster:
 
     class TwoArrayNameDecorator(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
-            @deisa.register(Window('temperature', expected_window_size['temperature'])
-                            if expected_window_size['temperature']
-                            else "temperature",
-                            Window('pressure', expected_window_size['pressure'])
-                            if expected_window_size['pressure']
-                            else "pressure")
+            @deisa.register(
+                Window("temperature", expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                Window("pressure", expected_window_size["pressure"])
+                if expected_window_size["pressure"]
+                else "pressure",
+                exception_handler=self.exception_handler,
+                precompute=False,
+            )
             def cb(temperature: List[DeisaArray], pressure: List[DeisaArray]):
                 state["temperature"] = temperature
                 state["pressure"] = pressure
@@ -317,14 +470,46 @@ class TestUsingDaskCluster:
             self.check_array("temperature", state, i, expected)
             self.check_array("pressure", state, i, expected)
 
+    class ThreeArrayNameDecoratorSlow(RegisterAndCheck):
+        def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
+            @deisa.register(
+                Window("temperature", expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                Window("pressure", expected_window_size["pressure"])
+                if expected_window_size["pressure"]
+                else "pressure",
+                "density",
+                exception_handler=self.exception_handler,
+                precompute=False,
+            )
+            def cb(temperature: List[DeisaArray], pressure: List[DeisaArray], density: List[DeisaArray]):
+                state["temperature"] = temperature
+                state["pressure"] = pressure
+                state["density"] = density
+                state["counter"] += 1
+                time.sleep(1)
+
+        def check(self, state, i, expected):
+            self.check_array("temperature", state, i, expected)
+            self.check_array("pressure", state, i, expected)
+            self.check_array("density", state, i, expected)
+
     class MapBlocks(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
             def map_block_function(block, block_info=None):
-                # print(f"map_block_function() block={block}, block_info={block_info}", flush=True)
                 return np.array([[1]])
 
-            @deisa.register(Window('temperature', size=expected_window_size['temperature'])
-                            if expected_window_size['temperature'] else 'temperature')
+            @deisa.register(
+                Window("temperature", size=expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                exception_handler=self.exception_handler,
+                # map_blocks(...).compute() materializes the array on the
+                # bridge (no chunk-local reduction to precompute), so this
+                # callback uses the legacy full-chunk path.
+                precompute=False,
+            )
             def cb(temperature: List[DeisaArray]):
                 meta = np.array([[0]])
                 res = temperature[-1].map_blocks(map_block_function, dtype=int, meta=meta).compute()
@@ -332,161 +517,202 @@ class TestUsingDaskCluster:
                 if "map_block" not in state:
                     state["map_block"] = 0
 
-                state['map_block'] += res.sum()
+                state["map_block"] += res.sum()
                 state["temperature"] = temperature
                 state["counter"] += 1
 
         def check(self, state, i, expected):
             self.check_array("temperature", state, i, expected)
-            assert state['map_block'] == i * state["temperature"][-1].npartitions, "map_block function was not called"
+            assert state["map_block"] == i * state["temperature"][-1].npartitions, "map_block function was not called"
 
-    # @pytest.mark.flaky(retries=3, delay=1)
-    @pytest.mark.timeout(30)
-    @pytest.mark.parametrize('temperature_global_grid_size', [(8, 8)])
-    @pytest.mark.parametrize('temperature_window_size', [None, 1, 3])
-    @pytest.mark.parametrize('pressure_global_grid_size', [(8, 8)])
-    @pytest.mark.parametrize('pressure_window_size', [None, 1])
-    @pytest.mark.parametrize('mpi_parallelism', [(1, 1), (2, 2)])
-    @pytest.mark.parametrize('nb_iterations', [1, 5])
-    @pytest.mark.parametrize('register_fn', [SingleArrayName(), TwoArrayName(),
-                                             SingleArrayNameDecorator(), TwoArrayNameDecorator(),
-                                             MapBlocks()])
-    def test_register_callback(self, temperature_global_grid_size: tuple,
-                               pressure_global_grid_size: tuple,
-                               mpi_parallelism: tuple,
-                               nb_iterations: int,
-                               temperature_window_size: int,
-                               pressure_window_size: int,
-                               register_fn: RegisterAndCheck,
-                               env_setup):
-        print(f"temperature_global_grid_size={temperature_global_grid_size}, "
-              f"pressure_global_grid_size={pressure_global_grid_size}, "
-              f"mpi_parallelism={mpi_parallelism}, "
-              f"nb_iterations={nb_iterations}, "
-              f"temperature_window_size={temperature_window_size}, "
-              f"pressure_window_size={pressure_window_size}")
+    @pytest.mark.filterwarnings("error")
+    # The ceiling spans fixture setup too (pytest-timeout's func_only default), and each item spawns a fresh
+    # LocalCluster; 90 s keeps a wedged item bounded without failing on that spawn cost.
+    @pytest.mark.timeout(90)
+    @pytest.mark.parametrize("temperature_global_grid_size", [(8, 8)])
+    @pytest.mark.parametrize("temperature_window_size", [None, 1, 3])
+    @pytest.mark.parametrize("pressure_global_grid_size", [(8, 8)])
+    @pytest.mark.parametrize("pressure_window_size", [None, 1])
+    @pytest.mark.parametrize("mpi_parallelism", [(2, 2)])
+    @pytest.mark.parametrize("nb_iterations", [1, 10])
+    @pytest.mark.parametrize(
+        "register_fn",
+        [
+            SingleArrayName(),
+            TwoArrayName(),
+            SingleArrayNameDecorator(),
+            TwoArrayNameDecorator(),
+            ThreeArrayNameDecoratorSlow(),
+            MapBlocks(),
+        ],
+    )
+    def test_register_callback(
+        self,
+        temperature_global_grid_size: tuple,
+        pressure_global_grid_size: tuple,
+        mpi_parallelism: tuple,
+        nb_iterations: int,
+        temperature_window_size: int,
+        pressure_window_size: int,
+        register_fn: RegisterAndCheck,
+        env_setup,
+    ):
+        print(
+            f"temperature_global_grid_size={temperature_global_grid_size}, "
+            f"pressure_global_grid_size={pressure_global_grid_size}, "
+            f"mpi_parallelism={mpi_parallelism}, "
+            f"nb_iterations={nb_iterations}, "
+            f"temperature_window_size={temperature_window_size}, "
+            f"pressure_window_size={pressure_window_size}, "
+            f"register_fn={register_fn}"
+        )
 
         client, cluster = env_setup
 
-        sim = TestSimulation(client,
-                             mpi_parallelism=mpi_parallelism,
-                             arrays_metadata={
-                                 'temperature': {
-                                     'global_shape': temperature_global_grid_size,
-                                     'chunk_shape': (temperature_global_grid_size[0] // mpi_parallelism[0],
-                                                     temperature_global_grid_size[1] // mpi_parallelism[1]),
-                                     'chunk_position': (0, 0)  # TODO
-                                 },
-                                 'pressure': {
-                                     'global_shape': pressure_global_grid_size,
-                                     'chunk_shape': (pressure_global_grid_size[0] // mpi_parallelism[0],
-                                                     pressure_global_grid_size[1] // mpi_parallelism[1]),
-                                     'chunk_position': (0, 0)  # TODO
-                                 }
-                             },
-                             wait_for_go=False)
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "temperature": {
+                    "global_shape": temperature_global_grid_size,
+                    "chunk_shape": tuple(g // p for g, p in zip(temperature_global_grid_size, mpi_parallelism)),
+                },
+                "pressure": {
+                    "global_shape": pressure_global_grid_size,
+                    "chunk_shape": tuple(g // p for g, p in zip(pressure_global_grid_size, mpi_parallelism)),
+                },
+                "density": {
+                    "global_shape": pressure_global_grid_size,
+                    "chunk_shape": tuple(g // p for g, p in zip(pressure_global_grid_size, mpi_parallelism)),
+                },
+            },
+            wait_for_go=False,
+        )
         deisa = Deisa()
 
-        time.sleep(.2)  # wait for bridges and deisa to be ready
+        register_fn.register_cb(
+            self.state,
+            deisa,
+            {"temperature": temperature_window_size, "pressure": pressure_window_size, "density": pressure_window_size},
+        )
 
-        register_fn.register_cb(self.state, deisa, {
-            'temperature': temperature_window_size,
-            'pressure': pressure_window_size,
-        })
+        time.sleep(0.2)  # wait for bridges and deisa to be ready
 
         for i in range(1, nb_iterations + 1):
             print(f"iteration {i}", flush=True)
 
-            global_temperature, global_pressure = sim.generate_data('temperature', 'pressure', iteration=i)
-            global_temperature_da = da.from_array(global_temperature,
-                                                  chunks=(temperature_global_grid_size[0] // mpi_parallelism[0],
-                                                          temperature_global_grid_size[1] // mpi_parallelism[1]))
-            global_pressure_da = da.from_array(global_pressure,
-                                               chunks=(pressure_global_grid_size[0] // mpi_parallelism[0],
-                                                       pressure_global_grid_size[1] // mpi_parallelism[1]))
+            global_temperature, global_pressure, global_density = sim.generate_data(
+                "temperature", "pressure", "density", iteration=i
+            )
 
-            assert wait_for(lambda: self.state['counter'] == i, timeout=10), "callback was not called"
+            gc.collect()
 
-            register_fn.check(self.state, i, {
-                "temperature": {"global_da": global_temperature_da,
-                                "window_size": temperature_window_size},
-                "pressure": {"global_da": global_pressure_da,
-                             "window_size": pressure_window_size}
-            })
+            global_temperature_da = da.from_array(
+                global_temperature,
+                chunks=tuple(size // n_chunks for size, n_chunks in zip(global_temperature.shape, mpi_parallelism)),
+            )
+            global_pressure_da = da.from_array(
+                global_pressure,
+                chunks=tuple(size // n_chunks for size, n_chunks in zip(global_pressure.shape, mpi_parallelism)),
+            )
 
-        del deisa
+            global_density_da = da.from_array(
+                global_density,
+                chunks=tuple(size // n_chunks for size, n_chunks in zip(global_pressure.shape, mpi_parallelism)),
+            )
+
+            assert wait_for(lambda: self.state["counter"] == i, timeout=10), "callback was not called"
+
+            register_fn.check(
+                self.state,
+                i,
+                {
+                    "temperature": {"global_da": global_temperature_da, "window_size": temperature_window_size},
+                    "pressure": {"global_da": global_pressure_da, "window_size": pressure_window_size},
+                    "density": {"global_da": global_density_da, "window_size": pressure_window_size},
+                },
+            )
+
+        del sim
+
+        # del deisa
+        deisa.execute_callbacks()
 
     def test_callback_throws(self, env_setup):
         client, cluster = env_setup
         global_grid_size = (8, 8)
         mpi_parallelism = (2, 2)
 
-        sim = TestSimulation(client,
-                             mpi_parallelism=mpi_parallelism,
-                             arrays_metadata={
-                                 'my_array': {
-                                     'global_shape': global_grid_size,
-                                     'chunk_shape': (global_grid_size[0] // mpi_parallelism[0],
-                                                     global_grid_size[1] // mpi_parallelism[1]),
-                                     'chunk_position': (0, 0)  # TODO
-                                 }
-                             },
-                             wait_for_go=False)
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "my_array": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                    "chunk_position": (0, 0),  # TODO
+                }
+            },
+            wait_for_go=False,
+        )
         deisa = Deisa()
 
-        time.sleep(.2)  # wait for bridges and deisa to be ready
+        time.sleep(0.2)  # wait for bridges and deisa to be ready
 
-        context = {
-            'counter': 0,
-            'exception_handler': 0
-        }
+        context = {"counter": 0, "exception_handler": 0}
 
         def window_callback(window: list[DeisaArray]):
             print(f"hello from window_callback. iteration={window[-1].t}", flush=True)
-            context['counter'] += 1
+            context["counter"] += 1
             raise RuntimeError("Throw from user callback")
 
         def custom_exception_handler(exception):
             print(f"hello from custom_exception_handler. exception={exception}", flush=True)
-            context['exception_handler'] += 1
+            context["exception_handler"] += 1
 
         def custom_exception_handler_raise(exception):
             print(f"hello from custom_exception_handler. exception={exception}", flush=True)
-            context['exception_handler'] += 1
+            context["exception_handler"] += 1
             raise RuntimeError("Throw from user exception handler.")
 
         # default exception_handler
-        callback_id = deisa.register_callback(window_callback, 'my_array')
+        callback_id = deisa.register_callback(window_callback, "my_array", precompute=False)
         assert callback_id is not None, "callback was not registered"
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=1)
-        assert wait_for(lambda: context['counter'] == 1, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 0), "callback was not called"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=1)
+        assert wait_for(lambda: context["counter"] == 1, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 0), "callback was not called"
 
         # custom error handler
         deisa.unregister_callback(callback_id)
-        callback_id = deisa.register_callback(window_callback, 'my_array',
-                                              exception_handler=custom_exception_handler)
+        callback_id = deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
+        )
         assert callback_id is not None, "callback was not registered"
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=2)
-        assert wait_for(lambda: context['counter'] == 2, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 1), "callback was not called"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=2)
+        assert wait_for(lambda: context["counter"] == 2, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 1), "callback was not called"
 
         # custom error handler that throws
         deisa.unregister_callback(callback_id)
-        callback_id = deisa.register_callback(window_callback, 'my_array',
-                                              exception_handler=custom_exception_handler_raise)
+        callback_id = deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
+        )
         assert callback_id is not None, "callback was not registered"
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=3)
-        assert wait_for(lambda: context['counter'] == 3, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 2), "callback was not called"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=3)
+        assert wait_for(lambda: context["counter"] == 3, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 2), "callback was not called"
 
-        # callback unregistered due to unhandled exception in custom_exception_handler_raise. Should no longer be called.
-        sim.generate_data('my_array', iteration=4)
-        assert wait_for(lambda: context['counter'] == 3, nb_checks=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 2), "callback was not called"
+        # callback unregistered due to unhandled exception in custom_exception_handler_raise.
+        # Should no longer be called.
+        sim.generate_data("my_array", iteration=4)
+        assert wait_for(lambda: context["counter"] == 3, nb_checks=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 2), "callback was not called"
 
         async_close_bridges(sim.bridges, 4)
         deisa.execute_callbacks()
@@ -496,113 +722,170 @@ class TestUsingDaskCluster:
         global_grid_size = (8, 8)
         mpi_parallelism = (2, 2)
 
-        sim = TestSimulation(client,
-                             mpi_parallelism=mpi_parallelism,
-                             arrays_metadata={
-                                 'my_array': {
-                                     'global_shape': global_grid_size,
-                                     'chunk_shape': (global_grid_size[0] // mpi_parallelism[0],
-                                                     global_grid_size[1] // mpi_parallelism[1]),
-                                     'chunk_position': (0, 0)  # TODO
-                                 }
-                             },
-                             wait_for_go=False)
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "my_array": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                    "chunk_position": (0, 0),  # TODO
+                }
+            },
+            wait_for_go=False,
+        )
         deisa = Deisa()
 
-        time.sleep(.2)  # wait for bridges and deisa to be ready
+        time.sleep(0.2)  # wait for bridges and deisa to be ready
 
-        context = {
-            'counter': 0,
-            'exception_handler': 0
-        }
+        context = {"counter": 0, "exception_handler": 0}
 
-        @deisa.register("my_array")
+        @deisa.register("my_array", precompute=False)
         def window_callback(my_array: list[DeisaArray]):
             print(f"hello from window_callback. iteration={my_array[-1].t}", flush=True)
-            context['counter'] += 1
+            context["counter"] += 1
             raise RuntimeError("Throw from user callback")
 
         def custom_exception_handler(exception):
             print(f"hello from custom_exception_handler. exception={exception}", flush=True)
-            context['exception_handler'] += 1
+            context["exception_handler"] += 1
 
         def custom_exception_handler_raise(exception):
             print(f"hello from custom_exception_handler. exception={exception}", flush=True)
-            context['exception_handler'] += 1
+            context["exception_handler"] += 1
             raise RuntimeError("Throw from user exception handler.")
 
         # default exception_handler (set by decorator)
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=1)
-        assert wait_for(lambda: context['counter'] == 1, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 0), "callback was not called"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=1)
+        assert wait_for(lambda: context["counter"] == 1, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 0), "callback was not called"
 
         # custom error handler
         deisa.unregister_callback(window_callback)
-        deisa.register_callback(window_callback, 'my_array',
-                                exception_handler=custom_exception_handler)
+        deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
+        )
         # assert window_callback.callback_id is not None, "callback was not registered"
-        assert 'my_array' in deisa._callbacks_by_array, "callback was not registered for my_array"
-        assert len(deisa._callbacks_by_array['my_array']) == 1, "expected exactly one callback registered"
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=2)
-        assert wait_for(lambda: context['counter'] == 2, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 1), "callback was not called"
+        assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
+        assert len(deisa._callbacks_by_array["my_array"]) == 1, "expected exactly one callback registered"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=2)
+        assert wait_for(lambda: context["counter"] == 2, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 1), "callback was not called"
 
         # custom error handler that throws
         deisa.unregister_callback(window_callback)
-        deisa.register_callback(window_callback, 'my_array',
-                                exception_handler=custom_exception_handler_raise)
+        deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
+        )
         # assert window_callback.callback_id is not None, "callback was not registered"
-        assert 'my_array' in deisa._callbacks_by_array, "callback was not registered for my_array"
-        assert len(deisa._callbacks_by_array['my_array']) == 1, "expected exactly one callback registered"
-        time.sleep(.5)
-        sim.generate_data('my_array', iteration=3)
-        assert wait_for(lambda: context['counter'] == 3, timeout=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 2), "callback was not called"
+        assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
+        assert len(deisa._callbacks_by_array["my_array"]) == 1, "expected exactly one callback registered"
+        time.sleep(0.5)
+        sim.generate_data("my_array", iteration=3)
+        assert wait_for(lambda: context["counter"] == 3, timeout=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 2), "callback was not called"
 
-        # callback unregistered due to unhandled exception in custom_exception_handler_raise. Should no longer be called.
-        sim.generate_data('my_array', iteration=4)
-        assert wait_for(lambda: context['counter'] == 3, nb_checks=10), "callback was not called"
-        assert wait_for(lambda: context['exception_handler'] == 2), "callback was not called"
+        # callback unregistered due to unhandled exception in custom_exception_handler_raise.
+        # Should no longer be called.
+        sim.generate_data("my_array", iteration=4)
+        assert wait_for(lambda: context["counter"] == 3, nb_checks=10), "callback was not called"
+        assert wait_for(lambda: context["exception_handler"] == 2), "callback was not called"
 
         async_close_bridges(sim.bridges, 4)
         deisa.execute_callbacks()
 
-    @pytest.mark.parametrize('nb_bridges', [1, 4])
+    def test_callback_bare_compute_uses_deisa_client(self, env_setup):
+        """A bare ``.compute()`` inside a callback must run on the Deisa client, not the caller's default client.
+
+        ``Deisa``'s client is created with ``set_as_default=False`` -- it must never hijack the process-wide Dask
+        scheduler -- so the callback body is the one place where its client has to be scoped explicitly. Computing
+        the delivered array from a foreign client releases the delivered scatter keys as soon as that graph
+        finishes, evicting the chunk from the workers before the callback returns (that is what made the
+        ``precompute=False`` memory control test lose the chunk in CI). ``Client.current(allow_global=False)``
+        raises outside a ``Client.as_current()`` scope, so it pins the scoping without any timing dependency.
+        """
+        client, cluster = env_setup
+        global_grid_size = (8, 8)
+        mpi_parallelism = (2, 2)
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "my_array": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                    "chunk_position": (0, 0),  # TODO
+                }
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa()
+
+        time.sleep(0.2)  # wait for bridges and deisa to be ready
+
+        context = {"client_ids": [], "sums": []}
+
+        @deisa.register("my_array", precompute=False)
+        def window_callback(my_array: list[DeisaArray]):
+            context["client_ids"].append(Client.current(allow_global=False).id)
+            context["sums"].append(float(my_array[-1].sum().compute()))
+
+        global_data = sim.generate_data("my_array", iteration=1)
+
+        assert wait_for(lambda: len(context["sums"]) == 1, timeout=10), "callback was not called"
+        assert context["client_ids"] == [deisa.client.id], (
+            f"callback body ran under client(s) {context['client_ids']!r}; expected the Deisa client "
+            f"{deisa.client.id!r}. A foreign client must not execute the callback's bare .compute()."
+        )
+        assert np.isclose(context["sums"][0], float(np.sum(global_data)))
+
+        async_close_bridges(sim.bridges, 4)
+        deisa.execute_callbacks()
+
+    @pytest.mark.parametrize("nb_bridges", [1, 4])
     def test_set_get(self, env_setup, nb_bridges: int):
         client, _ = env_setup
 
         comm_state = FakeComm.State(nb_bridges)
 
-        bridges = [Bridge(comm=FakeComm(comm_state, rank),
-                          arrays_metadata={
-                              'my_array': {
-                                  'global_shape': (0,),
-                                  'chunk_shape': (0,),
-                                  'chunk_position': (rank,)  # TODO
-                              }
-                          },
-                          wait_for_go=False) for rank in range(nb_bridges)]
+        def make_bridge(comm: FakeComm):
+            rank = comm.Get_rank()  # or comm.rank if you have it
+
+            return Bridge(
+                comm=comm,
+                arrays_metadata={"temperature": {"global_shape": (0,), "chunk_shape": (0,), "chunk_position": (rank,)}},
+                wait_for_go=False,
+            )
+
+        bridges = run_on_all_ranks(lambda: FakeComm(comm_state, 0), make_bridge)
 
         deisa = Deisa()
 
         for ts in range(5):
-            deisa.set('hello', 'world', timestep=ts)
+            deisa.set("hello", "world", timestep=ts)
 
-            res = async_map(bridges, Bridge.get, 'hello', timestep=ts)
+            res = async_map(bridges, Bridge.get, "hello", timestep=ts)
             assert wait_for(lambda: len(res) == nb_bridges)
-            assert all(r == 'world' for r in res)
+            assert all(r == "world" for r in res)
 
             # a second call to get should return the same result
-            res = async_map(bridges, Bridge.get, 'hello', timestep=ts)
+            res = async_map(bridges, Bridge.get, "hello", timestep=ts)
             assert wait_for(lambda: len(res) == nb_bridges)
-            assert all(r == 'world' for r in res)
+            assert all(r == "world" for r in res)
 
             # without timestep, should return the full queue
-            res = async_map(bridges, Bridge.get, 'hello')
+            res = async_map(bridges, Bridge.get, "hello")
             assert wait_for(lambda: len(res) == nb_bridges)
-            assert all(r == deque([(i, 'world') for i in range(ts + 1)]) for r in res)
+            assert all(r == deque([(i, "world") for i in range(ts + 1)]) for r in res)
 
         async_close_bridges(bridges, 4)
 
@@ -611,35 +894,37 @@ class TestUsingDaskCluster:
         global_grid_size = (8, 8)
         mpi_parallelism = (1, 1)
 
-        sim = TestSimulation(client,
-                             mpi_parallelism=mpi_parallelism,
-                             arrays_metadata={
-                                 'my_array': {
-                                     'global_shape': global_grid_size,
-                                     'chunk_shape': (global_grid_size[0] // mpi_parallelism[0],
-                                                     global_grid_size[1] // mpi_parallelism[1]),
-                                     'chunk_position': (0, 0)  # TODO
-                                 }
-                             },
-                             wait_for_go=False)
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "my_array": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                    "chunk_position": (0, 0),  # TODO
+                }
+            },
+            wait_for_go=False,
+        )
 
         deisa = Deisa()
 
-        time.sleep(.2)
+        time.sleep(0.2)
 
-        context = {
-            'counter': 0
-        }
+        context = {"counter": 0}
 
         def window_callback(window: list[DeisaArray]):
             print(f"hello from window_callback. iteration={window[-1].t}", flush=True)
-            context['counter'] += 1
-            deisa.set('hello', 'world', timestep=window[-1].t)
+            context["counter"] += 1
+            deisa.set("hello", "world", timestep=window[-1].t)
 
-        deisa.register_callback(window_callback, Window('my_array', size=1))
-        sim.generate_data('my_array', iteration=1)
-        assert wait_for(lambda: context['counter'] == 1)
-        assert wait_for(lambda: sim.bridges[0].get('hello', timestep=1) == 'world')
+        deisa.register_callback(window_callback, Window("my_array", size=1), precompute=False)
+        sim.generate_data("my_array", iteration=1)
+        assert wait_for(lambda: context["counter"] == 1)
+        assert wait_for(lambda: sim.bridges[0].get("hello", timestep=1) == "world")
 
         async_close_bridges(sim.bridges, 1)
 
@@ -647,3 +932,130 @@ class TestUsingDaskCluster:
         dask_arr = da.from_array(np.ones(1))
         deisa_array = build_deisa_array(dask_arr, 0)
         assert dask_array_element_wise_equal(dask_arr, deisa_array)
+
+    @pytest.mark.flaky(retries=3, delay=1)
+    def test_wait_for_tasks(self, env_setup):
+        client, cluster = env_setup
+
+        comm_state = FakeComm.State(4)
+
+        def make_bridge(comm: FakeCartComm):
+            rank = comm.Get_rank()  # or comm.rank if you have it
+
+            return Bridge(
+                comm=comm,
+                arrays_metadata={
+                    "temperature": {
+                        "global_shape": (8, 8),
+                        "chunk_shape": (4, 4),
+                        "chunk_position": comm.Get_coords(rank),
+                    }
+                },
+                wait_for_go=False,
+            )
+
+        bridges = run_on_all_ranks(lambda: FakeCartComm(comm_state, 0, dims=(2, 2)), make_bridge)
+
+        deisa = Deisa()
+
+        @deisa.register(Window("temperature", size=2))
+        def cb(temperatures):
+            temperatures[-1].sum().compute()
+
+        async def _bridge_send(ts: int):
+            await asyncio.gather(
+                *[
+                    asyncio.to_thread(
+                        bridge.send,
+                        "temperature",
+                        np.ones(bridge.arrays_metadata["temperature"]["chunk_shape"]),
+                        timestep=ts,
+                    )
+                    for i, bridge in enumerate(bridges)
+                ]
+            )
+
+        for ts in range(5):
+            asyncio.run(_bridge_send(ts))
+
+        async def _bridge_close():
+            await asyncio.gather(*[asyncio.to_thread(bridge.close, 0) for i, bridge in enumerate(bridges)])
+
+        asyncio.run(_bridge_close())
+
+        deisa.execute_callbacks()
+        del deisa
+
+        # 1 because of HandshakeActor
+        assert len(cluster.scheduler.tasks) == 1, (
+            f"Only 1 task should be left, but there are {len(cluster.scheduler.tasks)}: "
+            f"{sorted(cluster.scheduler.tasks)}"
+        )
+
+    def test_multi_array_callback_consistent_iterations(self, env_setup):
+        """Regression test for issue #128: missing iterations when using multiple arrays in a callback.
+
+        When arrays arrive at different times (e.g., due to async topic handlers), the callback must not fire until all
+        arrays have data for the same iteration.
+        """
+        client, cluster = env_setup
+        global_grid_size = (8, 8)
+        mpi_parallelism = (1, 1)
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=mpi_parallelism,
+            arrays_metadata={
+                "x": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                },
+                "y": {
+                    "global_shape": global_grid_size,
+                    "chunk_shape": (
+                        global_grid_size[0] // mpi_parallelism[0],
+                        global_grid_size[1] // mpi_parallelism[1],
+                    ),
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+        time.sleep(0.2)
+
+        # Record iterations at which the callback actually fires
+        called_iterations = []
+
+        @deisa.register("x", "y", precompute=False)
+        def cb(x_arrays, y_arrays):
+            x_t = x_arrays[-1].timestep
+            y_t = y_arrays[-1].timestep
+            called_iterations.append((x_t, y_t))
+
+        time.sleep(0.2)
+
+        # Send x and y arrays for iterations 1 through 3, individually
+        # to stress-test that they are not mixed across iterations
+        for i in range(1, 4):
+            x_data = np.random.random(global_grid_size)
+            y_data = np.random.random(global_grid_size)
+
+            x_chunk = x_data
+            y_chunk = y_data
+
+            sim.bridges[0].send("x", x_chunk, timestep=i)
+            sim.bridges[0].send("y", y_chunk, timestep=i)
+
+            assert wait_for(lambda: len(called_iterations) >= i, timeout=10), (
+                f"callback was not called for iteration {i}"
+            )
+
+        # The critical check: every callback invocation must have
+        # x and y at the same iteration
+        for x_t, y_t in called_iterations:
+            assert x_t == y_t, f"callback received inconsistent iterations: x at {x_t}, y at {y_t}"
+
+        async_close_bridges(sim.bridges, 1)
